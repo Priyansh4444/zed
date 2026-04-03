@@ -6,7 +6,6 @@
 use crate::{SkillContext, SkillsPromptTemplate, Template, Templates};
 use anyhow::{Result, anyhow};
 use collections::HashMap;
-use gpui::{App, AppContext, Context, Entity};
 use serde::Deserialize;
 use std::path::Path;
 use std::path::PathBuf;
@@ -20,8 +19,7 @@ pub struct Skill {
     path: PathBuf,
 }
 
-/// Metadata extracted from a skill's YAML frontmatter.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 struct SkillMetadata {
     name: String,
     description: String,
@@ -31,6 +29,7 @@ struct SkillMetadata {
     #[serde(default)]
     #[allow(dead_code)]
     metadata: HashMap<String, String>,
+    #[serde(alias = "allowed-tools")]
     #[allow(dead_code)]
     allowed_tools: Option<String>,
 }
@@ -100,8 +99,6 @@ impl SkillMetadata {
     }
 }
 
-/// Parses YAML frontmatter from a markdown file.
-/// Returns the parsed metadata and the markdown body.
 fn parse_skill_file(content: &str, expected_dir_name: &str) -> Result<(SkillMetadata, String)> {
     let content = content.trim_start();
 
@@ -114,14 +111,18 @@ fn parse_skill_file(content: &str, expected_dir_name: &str) -> Result<(SkillMeta
         Some(end) => {
             let yaml_end = 3 + end;
             let yaml = content[3..yaml_end].trim().to_string();
-            let body_start = yaml_end + 3;
-            let body = content[body_start..].trim_start().to_string();
+            let body_start = yaml_end + 4; // skip past "\n---"
+            let body = if body_start < content.len() {
+                content[body_start..].trim_start().to_string()
+            } else {
+                String::new()
+            };
             (yaml, body)
         }
         None => return Err(anyhow!("YAML frontmatter not properly closed with ---")),
     };
 
-    let metadata: SkillMetadata = serde_yml::from_str(&yaml_part)
+    let metadata: SkillMetadata = serde_yaml_ng::from_str(&yaml_part)
         .map_err(|e| anyhow!("failed to parse YAML frontmatter: {}", e))?;
 
     metadata.validate(expected_dir_name)?;
@@ -215,8 +216,12 @@ pub fn discover_all_skills_sync(worktree_roots: &[PathBuf]) -> HashMap<String, A
 /// Format skills for display in the system prompt using handlebars templating.
 pub fn format_skills_for_prompt(
     skills: &HashMap<String, Arc<Skill>>,
-    templates: Arc<Templates>,
-) -> String {
+    templates: &Templates,
+) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+
     let mut skill_list: Vec<_> = skills.values().collect();
     skill_list.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -234,66 +239,11 @@ pub fn format_skills_for_prompt(
         .collect();
 
     let template = SkillsPromptTemplate {
-        has_skills: !skill_contexts.is_empty(),
+        has_skills: true,
         skills: skill_contexts,
     };
 
-    template.render(&templates).unwrap_or_default()
-}
-
-/// Context entity that holds formatted skills for the system prompt.
-/// Populates itself asynchronously on creation.
-pub struct SkillsContext {
-    formatted_skills: Option<String>,
-}
-
-impl SkillsContext {
-    /// Create a new SkillsContext and spawn background task to populate it.
-    pub fn new(
-        worktree_roots: Vec<PathBuf>,
-        templates: Arc<Templates>,
-        cx: &mut App,
-    ) -> Entity<Self> {
-        cx.new(|cx: &mut Context<Self>| {
-            // Spawn async task that will populate the skills
-            cx.spawn(async move |this, cx| {
-                let formatted = cx
-                    .background_spawn(async move {
-                        let skills = discover_all_skills_sync(&worktree_roots);
-                        format_skills_for_prompt(&skills, templates)
-                    })
-                    .await;
-
-                this.update(cx, |this, _cx| {
-                    this.formatted_skills = Some(formatted);
-                })
-                .ok();
-            })
-            .detach();
-
-            Self {
-                formatted_skills: None,
-            }
-        })
-    }
-
-    /// Create a SkillsContext with pre-populated skills (for loading from DB).
-    pub fn from_formatted(formatted_skills: String, cx: &mut App) -> Entity<Self> {
-        cx.new(|_cx| Self {
-            formatted_skills: Some(formatted_skills),
-        })
-    }
-
-    /// Get the formatted skills string.
-    /// Returns empty string if not yet loaded.
-    pub fn formatted(&self) -> &str {
-        self.formatted_skills.as_deref().unwrap_or("")
-    }
-
-    /// Check if skills have been loaded.
-    pub fn is_loaded(&self) -> bool {
-        self.formatted_skills.is_some()
-    }
+    template.render(templates).ok()
 }
 
 /// Checks if a path is within a skills directory (global or worktree-specific).
@@ -549,7 +499,8 @@ This is the skill content."#;
             }),
         );
 
-        let result = format_skills_for_prompt(&skills, Templates::new());
+        let templates = Templates::new();
+        let result = format_skills_for_prompt(&skills, &templates).unwrap();
 
         // Verify all skills are present
         assert!(result.contains("a-skill"));
@@ -578,7 +529,8 @@ This is the skill content."#;
             }),
         );
 
-        let result = format_skills_for_prompt(&skills, Templates::new());
+        let templates = Templates::new();
+        let result = format_skills_for_prompt(&skills, &templates).unwrap();
 
         // The description should be truncated with "..."
         assert!(result.contains("..."));
@@ -601,7 +553,8 @@ This is the skill content."#;
             }),
         );
 
-        let result = format_skills_for_prompt(&skills, Templates::new());
+        let templates = Templates::new();
+        let result = format_skills_for_prompt(&skills, &templates).unwrap();
 
         // Short descriptions should NOT be truncated (no "..." appended)
         assert!(!result.contains("Short description..."));
@@ -621,7 +574,8 @@ This is the skill content."#;
             }),
         );
 
-        let result = format_skills_for_prompt(&skills, Templates::new());
+        let templates = Templates::new();
+        let result = format_skills_for_prompt(&skills, &templates).unwrap();
 
         // All fields should appear in the output
         assert!(result.contains("test-skill"));
@@ -644,7 +598,8 @@ This is the skill content."#;
             }),
         );
 
-        let result = format_skills_for_prompt(&skills, Templates::new());
+        let templates = Templates::new();
+        let result = format_skills_for_prompt(&skills, &templates).unwrap();
 
         // Should NOT contain "..." since it's exactly 1024 chars
         assert!(!result.contains("..."));
@@ -653,9 +608,9 @@ This is the skill content."#;
     #[test]
     fn test_format_skills_empty() {
         let skills = HashMap::default();
-        let result = format_skills_for_prompt(&skills, Templates::new());
-        // With no skills, template renders to empty string
-        assert!(result.is_empty());
+        let templates = Templates::new();
+        let result = format_skills_for_prompt(&skills, &templates);
+        assert!(result.is_none());
     }
 
     #[test]

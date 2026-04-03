@@ -2,14 +2,15 @@ use crate::{
     ContextServerRegistry, CopyPathTool, CreateDirectoryTool, DbLanguageModel, DbThread,
     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, GrepTool,
     ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot, ReadFileTool,
-    RestoreFileFromDiskTool, SaveFileTool, SkillsContext, SpawnAgentTool, StreamingEditFileTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    decide_permission_from_settings,
+    RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool, StreamingEditFileTool,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision,
+    UpdatePlanTool, WebSearchTool, decide_permission_from_settings,
 };
 use acp_thread::{MentionUri, UserMessageId};
 use action_log::ActionLog;
 use feature_flags::{
-    FeatureFlagAppExt as _, StreamingEditFileToolFeatureFlag, UpdatePlanToolFeatureFlag,
+    AgentSkillsFeatureFlag, FeatureFlagAppExt as _, StreamingEditFileToolFeatureFlag,
+    UpdatePlanToolFeatureFlag,
 };
 
 use agent_client_protocol as acp;
@@ -950,8 +951,7 @@ pub struct Thread {
     profile_id: AgentProfileId,
     project_context: Entity<ProjectContext>,
     pub(crate) templates: Arc<Templates>,
-    /// Formatted available skills for the system prompt.
-    available_skills: Entity<SkillsContext>,
+    available_skills: Option<String>,
     model: Option<Arc<dyn LanguageModel>>,
     summarization_model: Option<Arc<dyn LanguageModel>>,
     thinking_enabled: bool,
@@ -1045,13 +1045,29 @@ impl Thread {
             .and_then(|model| model.effort.clone());
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
             watch::channel(Self::prompt_capabilities(model.as_deref()));
-        let worktree_roots: Vec<std::path::PathBuf> = project
-            .read(cx)
-            .visible_worktrees(cx)
-            .map(|worktree| worktree.read(cx).abs_path().as_ref().to_path_buf())
-            .collect();
-        let available_skills = SkillsContext::new(worktree_roots, templates.clone(), cx);
-        Self {
+        let available_skills_task = if cx.has_flag::<AgentSkillsFeatureFlag>() {
+            let worktree_roots: Vec<PathBuf> = project
+                .read(cx)
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().as_ref().to_path_buf())
+                .collect();
+            let templates = templates.clone();
+            Some(cx.spawn(async move |this, cx| {
+                let formatted_skills = cx
+                    .background_spawn(async move {
+                        let skills = crate::discover_all_skills_sync(&worktree_roots);
+                        crate::format_skills_for_prompt(&skills, &templates)
+                    })
+                    .await;
+                this.update(cx, |this: &mut Thread, _cx| {
+                    this.available_skills = formatted_skills;
+                })
+                .ok();
+            }))
+        } else {
+            None
+        };
+        let thread = Self {
             id: acp::SessionId::new(uuid::Uuid::new_v4().to_string()),
             prompt_id: PromptId::new(),
             updated_at: Utc::now(),
@@ -1077,7 +1093,7 @@ impl Thread {
             profile_id,
             project_context,
             templates,
-            available_skills,
+            available_skills: None,
             model,
             summarization_model: None,
             thinking_enabled: enable_thinking,
@@ -1092,7 +1108,11 @@ impl Thread {
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
+        };
+        if let Some(task) = available_skills_task {
+            task.detach();
         }
+        thread
     }
 
     pub fn id(&self) -> &acp::SessionId {
@@ -1268,14 +1288,29 @@ impl Thread {
             watch::channel(Self::prompt_capabilities(model.as_deref()));
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
-        let worktree_roots: Vec<std::path::PathBuf> = project
-            .read(cx)
-            .visible_worktrees(cx)
-            .map(|worktree| worktree.read(cx).abs_path().as_ref().to_path_buf())
-            .collect();
-        let available_skills = SkillsContext::new(worktree_roots, templates.clone(), cx);
-
-        Self {
+        let available_skills_task = if cx.has_flag::<AgentSkillsFeatureFlag>() {
+            let worktree_roots: Vec<PathBuf> = project
+                .read(cx)
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().as_ref().to_path_buf())
+                .collect();
+            let templates = templates.clone();
+            Some(cx.spawn(async move |this, cx| {
+                let formatted_skills = cx
+                    .background_spawn(async move {
+                        let skills = crate::discover_all_skills_sync(&worktree_roots);
+                        crate::format_skills_for_prompt(&skills, &templates)
+                    })
+                    .await;
+                this.update(cx, |this: &mut Thread, _cx| {
+                    this.available_skills = formatted_skills;
+                })
+                .ok();
+            }))
+        } else {
+            None
+        };
+        let thread = Self {
             id,
             prompt_id: PromptId::new(),
             title: if db_thread.title.is_empty() {
@@ -1299,7 +1334,7 @@ impl Thread {
             profile_id,
             project_context,
             templates,
-            available_skills,
+            available_skills: None,
             model,
             summarization_model: None,
             thinking_enabled: db_thread.thinking_enabled,
@@ -1318,7 +1353,11 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
+        };
+        if let Some(task) = available_skills_task {
+            task.detach();
         }
+        thread
     }
 
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
@@ -2931,7 +2970,7 @@ impl Thread {
         let system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
-            available_skills: self.available_skills.read(cx).formatted().to_string(),
+            available_skills: self.available_skills.clone(),
             model_name: self.model.as_ref().map(|m| m.name().0.to_string()),
         }
         .render(&self.templates)

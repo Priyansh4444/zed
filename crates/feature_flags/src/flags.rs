@@ -82,3 +82,13 @@ impl FeatureFlag for ProjectPanelUndoRedoFeatureFlag {
         false
     }
 }
+
+pub struct AgentSkillsFeatureFlag;
+
+impl FeatureFlag for AgentSkillsFeatureFlag {
+    const NAME: &'static str = "agent-skills";
+
+    fn enabled_for_staff() -> bool {
+        false
+    }
+}

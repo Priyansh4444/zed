@@ -5,6 +5,7 @@ use super::tool_permissions::{
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::ToolKind;
 use anyhow::{Context as _, Result, anyhow};
+use feature_flags::FeatureFlagAppExt as _;
 use futures::StreamExt;
 use gpui::{App, Entity, SharedString, Task};
 use project::{Project, ProjectPath, WorktreeSettings};
@@ -184,27 +185,29 @@ impl AgentTool for ListDirectoryTool {
             let fs = project.read_with(cx, |project, _cx| project.fs().clone());
             let canonical_roots = canonicalize_worktree_roots(&project, &fs, cx).await;
 
-            if let Some(canonical_input) = crate::skills::is_skills_path(&input.path, &canonical_roots) {
-                // Skills directory access - list directly via FS
-                if !fs.is_dir(&canonical_input).await {
-                    return Err(format!("{} is not a directory.", input.path));
-                }
-
-                let mut entries = fs.read_dir(&canonical_input).await.map_err(|e| e.to_string())?;
-                let mut output = String::new();
-
-                while let Some(entry) = entries.next().await {
-                    let path = entry.map_err(|e| e.to_string())?;
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    let is_dir = fs.is_dir(&path).await;
-                    if is_dir {
-                        writeln!(output, "{}/", name).ok();
-                    } else {
-                        writeln!(output, "{}", name).ok();
+            if cx.update(|cx| cx.has_flag::<feature_flags::AgentSkillsFeatureFlag>()) {
+                if let Some(canonical_input) = crate::skills::is_skills_path(&input.path, &canonical_roots) {
+                    // Skills directory access - list directly via FS
+                    if !fs.is_dir(&canonical_input).await {
+                        return Err(format!("{} is not a directory.", input.path));
                     }
-                }
 
-                return Ok(output);
+                    let mut entries = fs.read_dir(&canonical_input).await.map_err(|e| e.to_string())?;
+                    let mut output = String::new();
+
+                    while let Some(entry) = entries.next().await {
+                        let path = entry.map_err(|e| e.to_string())?;
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        let is_dir = fs.is_dir(&path).await;
+                        if is_dir {
+                            writeln!(output, "{}/", name).ok();
+                        } else {
+                            writeln!(output, "{}", name).ok();
+                        }
+                    }
+
+                    return Ok(output);
+                }
             }
 
             let (project_path, symlink_canonical_target) =
