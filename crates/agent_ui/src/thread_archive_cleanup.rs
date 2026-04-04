@@ -6,6 +6,8 @@ use std::{
 
 use agent_client_protocol as acp;
 use anyhow::{Context as _, Result, anyhow};
+use collections::HashMap;
+use git::repository::{AskPassDelegate, CommitOptions, ResetMode};
 use gpui::{App, AsyncApp, Entity, Global, Task, WindowHandle};
 use parking_lot::Mutex;
 use project::{LocalProjectFlags, Project, WorktreeId, git_store::Repository};
@@ -41,6 +43,8 @@ struct RootPlan {
     root_path: PathBuf,
     main_repo_path: PathBuf,
     affected_projects: Vec<AffectedProject>,
+    worktree_repo: Option<Entity<Repository>>,
+    branch_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -66,11 +70,20 @@ enum FallbackTarget {
 
 #[derive(Clone)]
 struct CleanupPlan {
+    folder_paths: PathList,
     roots: Vec<RootPlan>,
     current_workspace: Option<Entity<Workspace>>,
     current_workspace_will_be_empty: bool,
     fallback: Option<FallbackTarget>,
     affected_workspaces: Vec<Entity<Workspace>>,
+}
+
+fn archived_worktree_ref_name(id: i64) -> String {
+    format!("refs/archived-worktrees/{}", id)
+}
+
+struct PersistOutcome {
+    archived_worktree_id: i64,
 }
 
 pub fn archive_thread(
@@ -133,6 +146,7 @@ fn build_cleanup_plan(
 
     if candidate_roots.is_empty() {
         return Some(CleanupPlan {
+            folder_paths: metadata.folder_paths,
             roots: Vec::new(),
             current_workspace,
             current_workspace_will_be_empty: false,
@@ -188,6 +202,7 @@ fn build_cleanup_plan(
     };
 
     Some(CleanupPlan {
+        folder_paths: metadata.folder_paths,
         roots: candidate_roots,
         current_workspace,
         current_workspace_will_be_empty,
@@ -214,7 +229,7 @@ fn build_root_plan(path: &Path, workspaces: &[Entity<Workspace>], cx: &App) -> O
         })
         .collect::<Vec<_>>();
 
-    let linked_snapshot = workspaces
+    let (linked_snapshot, worktree_repo) = workspaces
         .iter()
         .flat_map(|workspace| {
             workspace
@@ -230,13 +245,20 @@ fn build_root_plan(path: &Path, workspaces: &[Entity<Workspace>], cx: &App) -> O
             let snapshot = repo.read(cx).snapshot();
             (snapshot.is_linked_worktree()
                 && snapshot.work_directory_abs_path.as_ref() == path.as_path())
-            .then_some(snapshot)
+            .then_some((snapshot, repo))
         })?;
+
+    let branch_name = linked_snapshot
+        .branch
+        .as_ref()
+        .map(|b| b.name().to_string());
 
     Some(RootPlan {
         root_path: path,
         main_repo_path: linked_snapshot.original_repo_abs_path.to_path_buf(),
         affected_projects,
+        worktree_repo: Some(worktree_repo),
+        branch_name,
     })
 }
 
@@ -395,17 +417,43 @@ async fn run_cleanup(plan: CleanupPlan, cx: &mut AsyncApp) {
     }
 
     let mut git_removal_errors: Vec<(PathBuf, anyhow::Error)> = Vec::new();
+    let mut persist_errors: Vec<(PathBuf, anyhow::Error)> = Vec::new();
+    let mut persist_outcomes: HashMap<PathBuf, PersistOutcome> = HashMap::default();
 
     for root in &roots_to_delete {
+        if root.worktree_repo.is_some() {
+            match persist_worktree_state(root, &plan, cx).await {
+                Ok(outcome) => {
+                    persist_outcomes.insert(root.root_path.clone(), outcome);
+                }
+                Err(error) => {
+                    log::error!(
+                        "Failed to persist worktree state for {}: {error}",
+                        root.root_path.display()
+                    );
+                    persist_errors.push((root.root_path.clone(), error));
+                    continue;
+                }
+            }
+        }
+
         if let Err(error) = remove_root(root.clone(), cx).await {
+            if let Some(outcome) = persist_outcomes.remove(&root.root_path) {
+                rollback_persist(&outcome, root, cx).await;
+            }
             git_removal_errors.push((root.root_path.clone(), error));
         }
     }
 
     cleanup_empty_workspaces(&plan.affected_workspaces, cx).await;
 
-    if !git_removal_errors.is_empty() {
-        let detail = git_removal_errors
+    let all_errors: Vec<(PathBuf, anyhow::Error)> = persist_errors
+        .into_iter()
+        .chain(git_removal_errors)
+        .collect();
+
+    if !all_errors.is_empty() {
+        let detail = all_errors
             .into_iter()
             .map(|(path, error)| format!("{}: {error}", path.display()))
             .collect::<Vec<_>>()
@@ -616,6 +664,206 @@ async fn rollback_root(root: &RootPlan, cx: &mut AsyncApp) {
         });
         let _ = task.await;
     }
+}
+
+async fn persist_worktree_state(
+    root: &RootPlan,
+    plan: &CleanupPlan,
+    cx: &mut AsyncApp,
+) -> Result<PersistOutcome> {
+    let worktree_repo = root
+        .worktree_repo
+        .clone()
+        .context("no worktree repo entity for persistence")?;
+
+    // Step 1: Create WIP commit #1 (staged state)
+    let askpass = AskPassDelegate::new(cx, |_, _, _| {});
+    let commit_rx = worktree_repo.update(cx, |repo, cx| {
+        repo.commit(
+            "WIP staged".into(),
+            None,
+            CommitOptions {
+                allow_empty: true,
+                ..Default::default()
+            },
+            askpass,
+            cx,
+        )
+    });
+    commit_rx
+        .await
+        .map_err(|_| anyhow!("WIP staged commit canceled"))??;
+
+    // Step 2: Stage all files including untracked
+    let stage_rx = worktree_repo.update(cx, |repo, _cx| repo.stage_all_including_untracked());
+    if let Err(error) = stage_rx
+        .await
+        .map_err(|_| anyhow!("stage all canceled"))
+        .and_then(|inner| inner)
+    {
+        let rx = worktree_repo.update(cx, |repo, cx| {
+            repo.reset("HEAD~1".to_string(), ResetMode::Mixed, cx)
+        });
+        let _ = rx.await;
+        return Err(error.context("failed to stage all files including untracked"));
+    }
+
+    // Step 3: Create WIP commit #2 (unstaged/untracked state)
+    let askpass = AskPassDelegate::new(cx, |_, _, _| {});
+    let commit_rx = worktree_repo.update(cx, |repo, cx| {
+        repo.commit(
+            "WIP unstaged".into(),
+            None,
+            CommitOptions {
+                allow_empty: true,
+                ..Default::default()
+            },
+            askpass,
+            cx,
+        )
+    });
+    if let Err(error) = commit_rx
+        .await
+        .map_err(|_| anyhow!("WIP unstaged commit canceled"))
+        .and_then(|inner| inner)
+    {
+        let rx = worktree_repo.update(cx, |repo, cx| {
+            repo.reset("HEAD~1".to_string(), ResetMode::Mixed, cx)
+        });
+        let _ = rx.await;
+        return Err(error);
+    }
+
+    // Step 4: Read HEAD SHA after WIP commits
+    let head_sha_result = worktree_repo
+        .update(cx, |repo, _cx| repo.head_sha())
+        .await
+        .map_err(|_| anyhow!("head_sha canceled"))
+        .and_then(|r| r.context("failed to read HEAD SHA after WIP commits"))
+        .and_then(|opt| opt.context("HEAD SHA is None after WIP commits"));
+    let commit_hash = match head_sha_result {
+        Ok(sha) => sha,
+        Err(error) => {
+            let rx = worktree_repo.update(cx, |repo, cx| {
+                repo.reset("HEAD~2".to_string(), ResetMode::Mixed, cx)
+            });
+            let _ = rx.await;
+            return Err(error);
+        }
+    };
+
+    // Step 5: Create DB record
+    let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+    let worktree_path_str = root.root_path.to_string_lossy().to_string();
+    let main_repo_path_str = root.main_repo_path.to_string_lossy().to_string();
+    let branch_name = root.branch_name.clone();
+
+    let db_result = store
+        .read_with(cx, |store, cx| {
+            store.create_archived_worktree(
+                &worktree_path_str,
+                &main_repo_path_str,
+                branch_name.as_deref(),
+                &commit_hash,
+                cx,
+            )
+        })
+        .await
+        .context("failed to create archived worktree DB record");
+    let archived_worktree_id = match db_result {
+        Ok(id) => id,
+        Err(error) => {
+            let rx = worktree_repo.update(cx, |repo, cx| {
+                repo.reset("HEAD~2".to_string(), ResetMode::Mixed, cx)
+            });
+            let _ = rx.await;
+            return Err(error);
+        }
+    };
+
+    // Step 6: Link all threads on this worktree to the archived record
+    let session_ids: Vec<acp::SessionId> = store.read_with(cx, |store, _cx| {
+        store
+            .all_session_ids_for_path(&plan.folder_paths)
+            .cloned()
+            .collect()
+    });
+
+    for session_id in &session_ids {
+        let link_result = store
+            .read_with(cx, |store, cx| {
+                store.link_thread_to_archived_worktree(&session_id.0, archived_worktree_id, cx)
+            })
+            .await;
+        if let Err(error) = link_result {
+            store
+                .read_with(cx, |store, cx| {
+                    store.delete_archived_worktree(archived_worktree_id, cx)
+                })
+                .detach();
+            let rx = worktree_repo.update(cx, |repo, cx| {
+                repo.reset("HEAD~2".to_string(), ResetMode::Mixed, cx)
+            });
+            let _ = rx.await;
+            return Err(error.context("failed to link thread to archived worktree"));
+        }
+    }
+
+    // Step 7: Create git ref on main repo (non-fatal)
+    let ref_name = archived_worktree_ref_name(archived_worktree_id);
+    let main_repo_result = repository_for_root_removal(root, cx).await;
+    match main_repo_result {
+        Ok((main_repo, _temp_project)) => {
+            let rx = main_repo.update(cx, |repo, _cx| {
+                repo.update_ref(ref_name.clone(), commit_hash.clone())
+            });
+            if let Err(error) = rx
+                .await
+                .map_err(|_| anyhow!("update_ref canceled"))
+                .and_then(|r| r)
+            {
+                log::warn!(
+                    "Failed to create ref {} on main repo (non-fatal): {error}",
+                    ref_name
+                );
+            }
+        }
+        Err(error) => {
+            log::warn!(
+                "Could not find main repo to create ref {} (non-fatal): {error}",
+                ref_name
+            );
+        }
+    }
+
+    Ok(PersistOutcome {
+        archived_worktree_id,
+    })
+}
+
+async fn rollback_persist(outcome: &PersistOutcome, root: &RootPlan, cx: &mut AsyncApp) {
+    // Undo WIP commits on the worktree repo
+    if let Some(worktree_repo) = &root.worktree_repo {
+        let rx = worktree_repo.update(cx, |repo, cx| {
+            repo.reset("HEAD~2".to_string(), ResetMode::Mixed, cx)
+        });
+        let _ = rx.await;
+    }
+
+    // Delete the git ref on main repo
+    if let Ok((main_repo, _temp_project)) = repository_for_root_removal(root, cx).await {
+        let ref_name = archived_worktree_ref_name(outcome.archived_worktree_id);
+        let rx = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
+        let _ = rx.await;
+    }
+
+    // Delete the DB record
+    let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+    store
+        .read_with(cx, |store, cx| {
+            store.delete_archived_worktree(outcome.archived_worktree_id, cx)
+        })
+        .detach();
 }
 
 async fn cleanup_empty_workspaces(workspaces: &[Entity<Workspace>], cx: &mut AsyncApp) {
